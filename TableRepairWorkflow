@@ -1,0 +1,2440 @@
+using Application.Run.SelfGrind.Models;
+using Hardware.ControlCard.Base;
+using Hardware.Cylinder.Enum;
+using Hardware.Cylinder.Services;
+using Hardware.Inventer.Base;
+using Logger;
+using System;
+using System.Runtime.CompilerServices;
+using System.Threading;
+using System.Threading.Tasks;
+
+namespace Application.Run.SelfGrind.Services
+{
+    public class TableRepairWorkflow : ITableRepairWorkflow
+    {
+        private const int InventerFrequencyReachedTimeoutMs = 30000;
+        private const int CoolantOffDelayAfterHomingMs = 5000;
+
+        private const double DefaultRapidMoveSpeed = 10000;
+        private const double DefaultSafetyGapSpeed = 10;
+        private const double DefaultGrindSpeed = 1;
+        private const double DefaultRapidApproachOffset = 1000;
+        private const double DefaultSafetyEndBuffer = 20;
+
+        /// <summary>测试阶段 false；安全门/力矩事故等运行时互锁。Normal 达速检测仅在 Safety 阶段末启用。</summary>
+        private const bool SelfGrindRuntimeInterlocksEnabled = false;
+
+        private const double OverloadHomingSpeedUmS = 2000;
+        private const double SuspectOverloadReadingThreshold = 200.0;
+        private const int WheelHomeOverloadLogIntervalMs = 500;
+        private const int SpinStopLogThrottleMs = 500;
+        private const double SpinStopLogPositionDeltaUm = 5.0;
+        private const int SpindleParameterWriteMaxAttempts = 3;
+        private const int SpindleParameterWriteRetryDelayMs = 50;
+        private const int SpindleParameterWriteMaxAttemptsDuringMotion = 5;
+        private const int SpindleParameterWriteRetryDelayDuringMotionMs = 80;
+        private const double SpindleTargetSpeedToleranceRatio = 0.05;
+        private const double TableTargetSpeedToleranceRatio = 0.05;
+        private const double TableTargetSpeedMinToleranceRpm = 5;
+        private const int SpindlePdoSettleDelayMs = 30;
+        private const int SpindlePdoWheelQuietTimeoutMs = 500;
+        private const int SpindlePdoWheelQuietPollMs = 20;
+        private const double SpindlePdoWheelQuietVelocityThreshold = 1.0;
+
+        private readonly IControlCard _controlCard;
+        private readonly IInventerService _inventerService;
+        private readonly ICylinderManager _cylinderManager;
+        private readonly TableRepairWheelMoveController _wheelMove;
+        private readonly object _torqueLock = new object();
+        private readonly object _controlLock = new object();
+
+        private bool _torqueAccidentTriggered;
+        private volatile bool _pauseRequested;
+        private volatile bool _stopRequested;
+        private volatile bool _fastForwardRequested;
+        private volatile bool _debugStopRequested;
+        private bool _debugOverrideActive;
+        private double _debugTargetUm;
+        private double _debugSpeedUmS;
+        private double _debugSparkOutSecondsOverride;
+        private CancellationTokenSource _coolantOffCts;
+        private Task _coolantOffTask;
+        private bool _coolantMidpointCheckLogged;
+        private DateTime _rapidSegmentStartedUtc;
+        private int _rapidCoolantHalfDelayMs;
+        private bool _rapidMidpointActionsInProgress;
+        private double _lastWheelPositionUm = double.NaN;
+        private bool _overloadHomingTriggered;
+        private bool _overloadMidpointSpindleStopped;
+        private bool _wheelHomeMidpointStopped;
+        private double _overloadHomingStartUm;
+        private DateTime _lastWheelHomeOverloadLogUtc = DateTime.MinValue;
+        private DateTime _lastSpinStopTickLogUtc = DateTime.MinValue;
+        private double _lastSpinStopLoggedPos = double.NaN;
+        private IDebugTableRepairWorkflowProgress _debugProgress;
+        private ITableRepairWorkflowProgress _workflowProgress;
+        private TableRepairSessionCheckpoint _checkpoint;
+        private string _pendingWorkflowErrorMessage;
+
+        public TableRepairWorkflow(
+            IControlCard controlCard,
+            IInventerService inventerService,
+            ICylinderManager cylinderManager)
+        {
+            _controlCard = controlCard;
+            _inventerService = inventerService;
+            _cylinderManager = cylinderManager;
+            _wheelMove = new TableRepairWheelMoveController(controlCard);
+        }
+
+        public bool IsPaused { get; private set; }
+
+        public bool IsActive { get; private set; }
+
+        public async Task<TableRepairOutcome> RunAsync(
+            TableRepairRequest request,
+            ITableRepairWorkflowProgress progress,
+            CancellationToken cancellationToken)
+        {
+            if (request == null || request.Config == null)
+            {
+                ReportWorkflowError(progress, "请求或配置为空，无法启动。");
+                return TableRepairOutcome.Failed;
+            }
+
+            if (!ValidatePreconditions(request, out var errorMessage))
+            {
+                ReportWorkflowError(progress, errorMessage ?? "启动前检查失败。");
+                progress?.ReportPhase("失败");
+                return TableRepairOutcome.Failed;
+            }
+
+            lock (_controlLock)
+            {
+                if (IsActive)
+                {
+                    var busyMsg = IsDebugRequest(request)
+                        ? "一键修台流程仍在运行，请等待结束或先点「停机」。"
+                        : "一键修台流程正在运行。";
+                    ReportWorkflowError(progress, busyMsg);
+                    return TableRepairOutcome.Failed;
+                }
+
+                IsActive = true;
+                IsPaused = false;
+                _pauseRequested = false;
+                _stopRequested = false;
+            }
+
+            _workflowProgress = progress;
+            progress?.ClearOverloadAlert();
+            _torqueAccidentTriggered = false;
+            _overloadHomingTriggered = false;
+            _overloadMidpointSpindleStopped = false;
+            _wheelHomeMidpointStopped = false;
+            _lastWheelHomeOverloadLogUtc = DateTime.MinValue;
+            _lastSpinStopTickLogUtc = DateTime.MinValue;
+            _lastSpinStopLoggedPos = double.NaN;
+            _fastForwardRequested = false;
+            _debugStopRequested = false;
+            _pendingWorkflowErrorMessage = null;
+            _debugProgress = progress as IDebugTableRepairWorkflowProgress;
+            _coolantOffCts?.Cancel();
+            if (_coolantOffTask != null)
+            {
+                try
+                {
+                    await _coolantOffTask.ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                }
+                catch (Exception ex)
+                {
+                    Logs.LogWarning($"Self-Grind pending coolant off cleanup warning: {ex.Message}");
+                }
+            }
+
+            _coolantOffTask = null;
+            _coolantOffCts = null;
+            _inventerService.TorqueAccidentExceeded += OnTorqueAccidentExceeded;
+
+            var weights = request.PhaseWeights ?? new SelfGrindPhaseWeights();
+            var telemetryCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            var telemetryTask = RunTelemetryLoopAsync(progress, telemetryCts.Token);
+            var stopHandled = false;
+
+            try
+            {
+                LogDebugInfo($"RunAsync started RunMode={request.RunMode}");
+                InitializeCheckpoint(request);
+                progress?.ReportStartPosition(_checkpoint.RecordedStartPosition);
+                progress?.ReportPhase("准备");
+                await AwaitRunGateAsync(cancellationToken).ConfigureAwait(false);
+
+                while (_checkpoint.Step != TableRepairWorkflowStep.Done)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    ThrowIfStopRequested();
+                    await AwaitRunGateAsync(cancellationToken).ConfigureAwait(false);
+
+                    LogDebugInfo($"Executing step={_checkpoint.Step}");
+
+                    switch (_checkpoint.Step)
+                    {
+                        case TableRepairWorkflowStep.Rapid:
+                            progress?.ReportPhase("快进");
+                            if (!await ExecuteRapidPhaseAsync(progress, weights, cancellationToken).ConfigureAwait(false))
+                            {
+                                return await HandleFailureAsync(progress).ConfigureAwait(false);
+                            }
+
+                            await CompletePhaseAndMaybeAutoPauseAsync(TableRepairWorkflowStep.Rapid, weights, cancellationToken)
+                                .ConfigureAwait(false);
+                            break;
+
+                        case TableRepairWorkflowStep.Safety:
+                            progress?.ReportPhase("安全");
+                            if (!await ExecuteSafetyPhaseAsync(progress, weights, cancellationToken).ConfigureAwait(false))
+                            {
+                                return await HandleFailureAsync(progress).ConfigureAwait(false);
+                            }
+
+                            await CompletePhaseAndMaybeAutoPauseAsync(TableRepairWorkflowStep.Safety, weights, cancellationToken)
+                                .ConfigureAwait(false);
+                            break;
+
+                        case TableRepairWorkflowStep.Grind:
+                            progress?.ReportPhase("切削");
+                            if (!await ExecuteGrindPhaseAsync(progress, weights, cancellationToken).ConfigureAwait(false))
+                            {
+                                return await HandleFailureAsync(progress).ConfigureAwait(false);
+                            }
+
+                            await CompletePhaseAndMaybeAutoPauseAsync(TableRepairWorkflowStep.Grind, weights, cancellationToken)
+                                .ConfigureAwait(false);
+                            break;
+
+                        case TableRepairWorkflowStep.SparkOut:
+                            progress?.ReportPhase("Spark Out");
+                            if (!await ExecuteSparkOutPhaseAsync(progress, weights, cancellationToken).ConfigureAwait(false))
+                            {
+                                return await HandleFailureAsync(progress).ConfigureAwait(false);
+                            }
+
+                            await CompletePhaseAndMaybeAutoPauseAsync(TableRepairWorkflowStep.SparkOut, weights, cancellationToken)
+                                .ConfigureAwait(false);
+                            break;
+
+                        case TableRepairWorkflowStep.Escape:
+                            progress?.ReportPhase("Escape");
+                            if (!await ExecuteEscapePhaseAsync(progress, weights, cancellationToken).ConfigureAwait(false))
+                            {
+                                return await HandleFailureAsync(progress).ConfigureAwait(false);
+                            }
+
+                            await CompletePhaseAndMaybeAutoPauseAsync(TableRepairWorkflowStep.Escape, weights, cancellationToken)
+                                .ConfigureAwait(false);
+                            break;
+
+                        case TableRepairWorkflowStep.WheelHome:
+                            if (IsDebugMode())
+                            {
+                                var debugEndUm = GetWheelPosition();
+                                await EnsureSpindleStoppedAfterReturnPhaseAsync().ConfigureAwait(false);
+                                progress?.ReportEndPosition(debugEndUm);
+                                progress?.ReportProgress(100, 100);
+                                progress?.ReportPhase("完成");
+                                Logs.LogInfo(
+                                    $"Self-Grind debug completed. Start={_checkpoint.RecordedStartPosition:F3}, End={debugEndUm:F3}");
+                                ScheduleCoolantOffAfterHomingAsync();
+                                return TableRepairOutcome.Success;
+                            }
+
+                            progress?.ReportPhase("回零");
+                            if (!await ExecuteWheelHomePhaseAsync(progress, weights, cancellationToken).ConfigureAwait(false))
+                            {
+                                return await HandleFailureAsync(progress).ConfigureAwait(false);
+                            }
+
+                            CompletePhase(TableRepairWorkflowStep.WheelHome, weights);
+                            var endPosition = GetWheelPosition();
+                            progress?.ReportEndPosition(endPosition);
+                            progress?.ReportProgress(100, 100);
+                            progress?.ReportPhase("完成");
+                            Logs.LogInfo(
+                                $"Self-Grind completed. Start={_checkpoint.RecordedStartPosition:F3}, End={endPosition:F3}");
+                            return TableRepairOutcome.Success;
+
+                        default:
+                            _checkpoint.Step = TableRepairWorkflowStep.Rapid;
+                            break;
+                    }
+                }
+
+                return TableRepairOutcome.Success;
+            }
+            catch (OperationCanceledException)
+            {
+                if (_stopRequested)
+                {
+                    stopHandled = true;
+                    if (_overloadHomingTriggered)
+                    {
+                        Logs.LogInfo(
+                            $"[SelfGrind-Overload] user stop during overload homing; skip StopMotionAndHomeAsync pos={GetWheelPosition():F3}");
+                    }
+                    else if (IsDebugMode() && _debugStopRequested)
+                    {
+                        await StopMotionAndHomeForDebugAsync().ConfigureAwait(false);
+                    }
+                    else
+                    {
+                        await StopMotionAndHomeAsync().ConfigureAwait(false);
+                    }
+
+                    progress?.ReportEndPosition(GetWheelPosition());
+                    progress?.ReportPhase("Idle");
+                    Logs.LogInfo("Self-Grind workflow stopped by user.");
+                    return TableRepairOutcome.Cancelled;
+                }
+
+                progress?.ReportPhase("Idle");
+                Logs.LogInfo("Self-Grind workflow cancelled.");
+                return TableRepairOutcome.Cancelled;
+            }
+            catch (OverloadLimitExceededException)
+            {
+                stopHandled = true;
+                Logs.LogInfo(
+                    $"[SelfGrind-Overload] workflow failed after overload handling finalPos={GetWheelPosition():F3}");
+                progress?.ReportPhase("失败");
+                progress?.ReportEndPosition(GetWheelPosition());
+                return TableRepairOutcome.Failed;
+            }
+            catch (Exception ex)
+            {
+                stopHandled = true;
+                var failMsg = $"流程异常（Step={_checkpoint?.Step}）: {ex.Message}";
+                Logs.LogError($"Self-Grind workflow failed: {ex.Message}");
+                ReportWorkflowError(progress, failMsg);
+                progress?.ReportPhase("失败");
+                await StopMotionAndHomeAsync().ConfigureAwait(false);
+                progress?.ReportEndPosition(GetWheelPosition());
+                return TableRepairOutcome.Failed;
+            }
+            finally
+            {
+                _workflowProgress = null;
+                _inventerService.TorqueAccidentExceeded -= OnTorqueAccidentExceeded;
+                telemetryCts.Cancel();
+                try
+                {
+                    await telemetryTask.ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                }
+
+                if (!stopHandled && _stopRequested && !_overloadHomingTriggered)
+                {
+                    if (IsDebugMode() && _debugStopRequested)
+                    {
+                        await StopMotionAndHomeForDebugAsync().ConfigureAwait(false);
+                    }
+                    else
+                    {
+                        await StopMotionAndHomeAsync().ConfigureAwait(false);
+                    }
+                }
+                else if (!stopHandled && _stopRequested && _overloadHomingTriggered)
+                {
+                    Logs.LogInfo(
+                        $"[SelfGrind-Overload] finally: skip StopMotionAndHomeAsync (overload homing already handled) pos={GetWheelPosition():F3}");
+                }
+
+                if (_coolantOffTask != null)
+                {
+                    try
+                    {
+                        await _coolantOffTask.ConfigureAwait(false);
+                    }
+                    catch (Exception ex)
+                    {
+                        Logs.LogWarning($"Self-Grind coolant off await warning: {ex.Message}");
+                    }
+                }
+
+                _coolantOffTask = null;
+                _coolantOffCts = null;
+
+                Logs.LogInfo("[SelfGrind] RunAsync finally: setting IsActive=false");
+                lock (_controlLock)
+                {
+                    IsActive = false;
+                    IsPaused = false;
+                    _pauseRequested = false;
+                    _stopRequested = false;
+                    _fastForwardRequested = false;
+                    _debugStopRequested = false;
+                }
+
+                Logs.LogInfo("[SelfGrind] RunAsync finally: IsActive=false");
+            }
+        }
+
+        public async Task RequestPauseAsync()
+        {
+            lock (_controlLock)
+            {
+                if (!IsActive || IsPaused)
+                {
+                    return;
+                }
+
+                _pauseRequested = true;
+            }
+
+            await EnterPauseAsync().ConfigureAwait(false);
+        }
+
+        public Task RequestStopAsync()
+        {
+            lock (_controlLock)
+            {
+                _stopRequested = true;
+                _pauseRequested = false;
+            }
+
+            Logs.LogInfo("[SelfGrind] RequestStopAsync: _stopRequested set");
+            return Task.CompletedTask;
+        }
+
+        public Task RequestDebugStopAsync()
+        {
+            lock (_controlLock)
+            {
+                _debugStopRequested = true;
+                _stopRequested = true;
+                _pauseRequested = false;
+                _fastForwardRequested = false;
+            }
+
+            return Task.CompletedTask;
+        }
+
+        public async Task RequestFastForwardAsync()
+        {
+            lock (_controlLock)
+            {
+                if (!IsActive || IsPaused)
+                {
+                    return;
+                }
+
+                _fastForwardRequested = true;
+            }
+
+            _wheelMove.Reset();
+            try
+            {
+                await _controlCard.StopAxisAsync(AxisType.Wheel).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                Logs.LogWarning($"Self-Grind fast-forward stop warning: {ex.Message}");
+            }
+
+            if (_checkpoint?.Step == TableRepairWorkflowStep.Rapid
+                && !_checkpoint.RapidMidpointPassed
+                && IsRapidMidpointReached())
+            {
+                await TryExecuteRapidMidpointActionsAsync(CancellationToken.None, reportSpindleFailure: false)
+                    .ConfigureAwait(false);
+            }
+        }
+
+        public void SetDebugPhaseOverrides(
+            double targetUm,
+            double speedUmS,
+            double sparkOutSecondsOverride,
+            bool active)
+        {
+            _debugOverrideActive = active;
+            _debugTargetUm = targetUm;
+            _debugSpeedUmS = speedUmS;
+            _debugSparkOutSecondsOverride = sparkOutSecondsOverride;
+        }
+
+        public void ResumeWithConfig(SelfGrindConfig config)
+        {
+            if (config == null || _checkpoint?.Request == null)
+            {
+                var msg = _checkpoint?.Request == null
+                    ? "无法恢复：流程检查点不存在，请关闭调试界面后重新打开。"
+                    : "无法恢复：配置为空。";
+                ReportWorkflowError(_workflowProgress, msg);
+                Logs.LogError($"[SelfGrind-Debug] ResumeWithConfig failed: {msg}");
+                return;
+            }
+
+            _checkpoint.Request.Config = config;
+            lock (_controlLock)
+            {
+                _pauseRequested = false;
+                IsPaused = false;
+            }
+
+            LogDebugInfo($"ResumeWithConfig step={_checkpoint.Step} pauseRequested cleared");
+        }
+
+        private void InitializeCheckpoint(TableRepairRequest request)
+        {
+            var buffer = ResolveSafetyEndBuffer(request.Config);
+            var rapidApproachOffset = ResolveRapidApproachOffset(request.Config);
+            var recordedStart = GetWheelPosition();
+            var grindAmount = request.GrindAmount > 0 ? request.GrindAmount : 100;
+            double safetyPosition;
+            double grindTargetPosition;
+
+            if (request.RunMode == TableRepairRunMode.Debug)
+            {
+                if (request.B >= request.A)
+                {
+                    safetyPosition = request.A - rapidApproachOffset;
+                    grindTargetPosition = safetyPosition + grindAmount;
+                    LogDebugInfo(
+                        $"Debug: B>=A, adjusted Safety/D to {safetyPosition:F0} (A={request.A:F0})");
+                }
+                else
+                {
+                    safetyPosition = request.B - buffer;
+                    grindTargetPosition = request.B + grindAmount;
+                }
+
+                var rapidPosition = safetyPosition - rapidApproachOffset;
+                if (recordedStart >= rapidPosition)
+                {
+                    rapidPosition = recordedStart + rapidApproachOffset;
+                    LogDebugInfo(
+                        $"Debug: Z too high for default Rapid end, adjusted Rapid target to {rapidPosition:F0}");
+                }
+
+                _checkpoint = new TableRepairSessionCheckpoint
+                {
+                    Step = TableRepairWorkflowStep.Rapid,
+                    Request = request,
+                    RecordedStartPosition = recordedStart,
+                    SafetyPosition = safetyPosition,
+                    RapidPosition = rapidPosition,
+                    GrindTargetPosition = grindTargetPosition,
+                    CoolantReferencePosition = (recordedStart + rapidPosition) / 2,
+                    SparkOutElapsedSeconds = 0,
+                    CompletedWeightRatio = 0,
+                    SpindleAndTableRunning = false,
+                    CoolantEnabled = false,
+                    RapidMidpointPassed = false
+                };
+                LogCheckpointPositions(request, recordedStart, buffer, rapidApproachOffset, rapidPosition, safetyPosition);
+                return;
+            }
+
+            safetyPosition = request.B - buffer;
+            var normalRapidPosition = safetyPosition - rapidApproachOffset;
+            grindTargetPosition = request.B + request.GrindAmount;
+
+            _checkpoint = new TableRepairSessionCheckpoint
+            {
+                Step = TableRepairWorkflowStep.Rapid,
+                Request = request,
+                RecordedStartPosition = recordedStart,
+                SafetyPosition = safetyPosition,
+                RapidPosition = normalRapidPosition,
+                GrindTargetPosition = grindTargetPosition,
+                CoolantReferencePosition = (recordedStart + normalRapidPosition) / 2,
+                SparkOutElapsedSeconds = 0,
+                CompletedWeightRatio = 0,
+                SpindleAndTableRunning = false,
+                CoolantEnabled = false,
+                RapidMidpointPassed = false
+            };
+            LogCheckpointPositions(request, recordedStart, buffer, rapidApproachOffset, normalRapidPosition, safetyPosition);
+        }
+
+        private static void LogCheckpointPositions(
+            TableRepairRequest request,
+            double recordedStart,
+            double buffer,
+            double rapidApproachOffset,
+            double rapidPosition,
+            double safetyPosition)
+        {
+            Logs.LogInfo(
+                $"[SelfGrind] Checkpoint A={request.A:F3} B={request.B:F3} buffer={buffer:F0} offset={rapidApproachOffset:F0} " +
+                $"startZ={recordedStart:F3} C={rapidPosition:F3} D={safetyPosition:F3} grindEnd={request.B + request.GrindAmount:F3}");
+        }
+
+        private void CompletePhase(TableRepairWorkflowStep step, SelfGrindPhaseWeights weights)
+        {
+            var total = weights.Total;
+            if (total <= 0)
+            {
+                total = 100;
+            }
+
+            _checkpoint.CompletedWeightRatio += weights.WeightFor(step) / total;
+            _checkpoint.Step = step + 1;
+        }
+
+        private async Task CompletePhaseAndMaybeAutoPauseAsync(
+            TableRepairWorkflowStep step,
+            SelfGrindPhaseWeights weights,
+            CancellationToken cancellationToken)
+        {
+            CompletePhase(step, weights);
+
+            if (IsDebugMode())
+            {
+                _fastForwardRequested = false;
+
+                lock (_controlLock)
+                {
+                    if (!IsActive || IsPaused)
+                    {
+                        return;
+                    }
+
+                    _pauseRequested = true;
+                }
+
+                LogDebugInfo($"Phase {step} completed, entering auto-pause");
+                await EnterPauseAsync().ConfigureAwait(false);
+                _debugProgress?.ReportPhaseCompleted(step);
+                return;
+            }
+
+            if (_checkpoint.Request.RunMode == TableRepairRunMode.StepByStep)
+            {
+                lock (_controlLock)
+                {
+                    if (!IsActive || IsPaused)
+                    {
+                        return;
+                    }
+
+                    _pauseRequested = true;
+                }
+
+                await EnterPauseAsync().ConfigureAwait(false);
+            }
+        }
+
+        private async Task<bool> ExecuteRapidPhaseAsync(
+            ITableRepairWorkflowProgress progress,
+            SelfGrindPhaseWeights weights,
+            CancellationToken cancellationToken)
+        {
+            _checkpoint.MoveSegmentStartUm = GetWheelPosition();
+            _coolantMidpointCheckLogged = false;
+            var speed = ResolveRapidMoveSpeed(_checkpoint.Request.Config);
+            var target = _checkpoint.RapidPosition;
+            TryApplyDebugMoveOverride(ref target, ref speed);
+            var segmentUm = Math.Abs(target - _checkpoint.MoveSegmentStartUm);
+            var speedUmS = Math.Max(speed, 1);
+            _rapidCoolantHalfDelayMs = (int)Math.Ceiling(segmentUm / speedUmS / 2.0 * 1000.0);
+            _rapidSegmentStartedUtc = DateTime.UtcNow;
+            Logs.LogInfo(
+                $"[SelfGrind] Rapid coolant timing: segment={segmentUm:F0}um speed={speedUmS:F0}um/s halfDelay={_rapidCoolantHalfDelayMs}ms");
+            LogDebugInfo($"ExecuteRapid start={_checkpoint.MoveSegmentStartUm:F0} target={target:F0} speed={speed:F0}");
+
+            if (!await _wheelMove.TickMoveUntilAsync(
+                target,
+                speed,
+                () => AwaitRunGateAsync(cancellationToken),
+                ThrowIfTorqueAccident,
+                async () =>
+                {
+                    await ThrowIfOverloadExceededAsync(progress, cancellationToken).ConfigureAwait(false);
+
+                    if (!await TryExecuteRapidMidpointActionsAsync(cancellationToken).ConfigureAwait(false))
+                    {
+                        throw new InvalidOperationException("Rapid midpoint actions failed.");
+                    }
+
+                    var phaseProgress = CalculateMovePhaseProgress(
+                        _checkpoint.MoveSegmentStartUm,
+                        target,
+                        GetWheelPosition());
+                    ReportPhaseProgressForDebug(
+                        progress,
+                        weights,
+                        TableRepairWorkflowStep.Rapid,
+                        phaseProgress,
+                        0,
+                        target,
+                        _checkpoint.MoveSegmentStartUm);
+                },
+                cancellationToken,
+                TableRepairWheelMoveController.RapidPhaseToleranceUm,
+                _checkpoint.MoveSegmentStartUm,
+                allowDirectionalOvershoot: true,
+                enableStallDetection: true,
+                shouldAbortEarly: () => _fastForwardRequested).ConfigureAwait(false))
+            {
+                return false;
+            }
+
+            Logs.LogInfo("[SelfGrind] Rapid segment complete; ensuring coolant and spindle/table are on.");
+            await EnsureCoolantOnAsync(cancellationToken).ConfigureAwait(false);
+            if (!await EnsureSpindleAndTableRunningAsync(cancellationToken).ConfigureAwait(false))
+            {
+                return false;
+            }
+
+            _checkpoint.RapidMidpointPassed = true;
+
+            ReportPhaseProgressForDebug(
+                progress,
+                weights,
+                TableRepairWorkflowStep.Rapid,
+                1,
+                0,
+                target,
+                _checkpoint.MoveSegmentStartUm);
+            return true;
+        }
+
+        private async Task<bool> ExecuteSafetyPhaseAsync(
+            ITableRepairWorkflowProgress progress,
+            SelfGrindPhaseWeights weights,
+            CancellationToken cancellationToken)
+        {
+            var config = _checkpoint.Request.Config;
+
+            _checkpoint.MoveSegmentStartUm = GetWheelPosition();
+            var target = _checkpoint.SafetyPosition;
+            var speed = ResolveSafetyGapSpeed(config);
+            TryApplyDebugMoveOverride(ref target, ref speed);
+            LogDebugInfo($"ExecuteSafety start={_checkpoint.MoveSegmentStartUm:F0} target={target:F0} speed={speed:F0}");
+
+            if (!await _wheelMove.TickMoveUntilAsync(
+                target,
+                speed,
+                () => AwaitRunGateAsync(cancellationToken),
+                ThrowIfTorqueAccident,
+                async () =>
+                {
+                    await ThrowIfOverloadExceededAsync(progress, cancellationToken).ConfigureAwait(false);
+
+                    var phaseProgress = CalculateMovePhaseProgress(
+                        _checkpoint.MoveSegmentStartUm,
+                        target,
+                        GetWheelPosition());
+                    ReportPhaseProgressForDebug(
+                        progress,
+                        weights,
+                        TableRepairWorkflowStep.Safety,
+                        phaseProgress,
+                        0,
+                        target,
+                        _checkpoint.MoveSegmentStartUm);
+                },
+                cancellationToken,
+                TableRepairWheelMoveController.SafetyPhaseToleranceUm,
+                enableStallDetection: true,
+                shouldAbortEarly: () => _fastForwardRequested).ConfigureAwait(false))
+            {
+                return false;
+            }
+
+            ReportPhaseProgressForDebug(
+                progress,
+                weights,
+                TableRepairWorkflowStep.Safety,
+                1,
+                0,
+                target,
+                _checkpoint.MoveSegmentStartUm);
+
+            if (!await VerifySpindleAndTableAtTargetSpeedAtPhaseEndAsync(
+                    progress,
+                    "安全",
+                    cancellationToken).ConfigureAwait(false))
+            {
+                return false;
+            }
+
+            return true;
+        }
+
+        private async Task<bool> ExecuteGrindPhaseAsync(
+            ITableRepairWorkflowProgress progress,
+            SelfGrindPhaseWeights weights,
+            CancellationToken cancellationToken)
+        {
+            await EnsureCoolantOnAsync(cancellationToken).ConfigureAwait(false);
+
+            double grindStartUm;
+            double target;
+            var speed = ResolveGrindSpeed(_checkpoint.Request.Config);
+            var totalGrindAmount = _checkpoint.Request.GrindAmount;
+            var isDebugGrind = IsDebugMode();
+            var safetyEndBuffer = ResolveSafetyEndBuffer(_checkpoint.Request.Config);
+            var calibrationB = _checkpoint.Request.B;
+            var totalGrindTravel = isDebugGrind
+                ? totalGrindAmount
+                : safetyEndBuffer + totalGrindAmount;
+
+            if (isDebugGrind)
+            {
+                grindStartUm = GetWheelPosition();
+                _checkpoint.MoveSegmentStartUm = grindStartUm;
+                target = grindStartUm + totalGrindAmount;
+                TryApplyDebugMoveOverride(ref target, ref speed);
+            }
+            else
+            {
+                grindStartUm = _checkpoint.SafetyPosition;
+                _checkpoint.MoveSegmentStartUm = grindStartUm;
+                target = _checkpoint.GrindTargetPosition;
+            }
+
+            if (!await _wheelMove.TickMoveUntilAsync(
+                target,
+                speed,
+                () => AwaitRunGateAsync(cancellationToken),
+                ThrowIfTorqueAccident,
+                async () =>
+                {
+                    await ThrowIfOverloadExceededAsync(progress, cancellationToken).ConfigureAwait(false);
+
+                    var currentPosition = GetWheelPosition();
+                    var traveled = Math.Abs(grindStartUm - currentPosition);
+                    double processProgress;
+                    if (isDebugGrind)
+                    {
+                        processProgress = totalGrindAmount > 0
+                            ? Math.Min(100, traveled / totalGrindAmount * 100)
+                            : 0;
+                    }
+                    else
+                    {
+                        var cutBelowB = Math.Max(0, currentPosition - calibrationB);
+                        processProgress = totalGrindAmount > 0
+                            ? Math.Min(100, cutBelowB / totalGrindAmount * 100)
+                            : 0;
+                    }
+
+                    var phaseProgress = totalGrindTravel > 0
+                        ? Math.Min(1, traveled / totalGrindTravel)
+                        : 0;
+                    ReportPhaseProgressForDebug(
+                        progress,
+                        weights,
+                        TableRepairWorkflowStep.Grind,
+                        phaseProgress,
+                        processProgress,
+                        target,
+                        grindStartUm);
+                },
+                cancellationToken,
+                TableRepairWheelMoveController.PositionToleranceUm,
+                enableStallDetection: true,
+                shouldAbortEarly: () => _fastForwardRequested).ConfigureAwait(false))
+            {
+                return false;
+            }
+
+            ReportPhaseProgressForDebug(
+                progress,
+                weights,
+                TableRepairWorkflowStep.Grind,
+                1,
+                100,
+                target,
+                grindStartUm);
+            return true;
+        }
+
+        private async Task<bool> ExecuteSparkOutPhaseAsync(
+            ITableRepairWorkflowProgress progress,
+            SelfGrindPhaseWeights weights,
+            CancellationToken cancellationToken)
+        {
+            var totalSeconds = ResolveSparkOutSeconds(_checkpoint.Request.Config);
+            if (IsDebugMode())
+            {
+                if (_debugSparkOutSecondsOverride > 0)
+                {
+                    totalSeconds = _debugSparkOutSecondsOverride;
+                }
+
+                ClearDebugOverrides();
+            }
+
+            Logs.LogInfo(
+                $"[SelfGrind-Overload] SparkOut enter totalSeconds={totalSeconds:F1} pos={GetWheelPosition():F0}");
+
+            if (totalSeconds <= 0)
+            {
+                Logs.LogInfo(
+                    $"[SelfGrind-Overload] SparkOut done elapsed=0/{totalSeconds:F1} pos={GetWheelPosition():F0}");
+                ReportPhaseProgressForDebug(
+                    progress,
+                    weights,
+                    TableRepairWorkflowStep.SparkOut,
+                    1,
+                    100,
+                    GetWheelPosition(),
+                    GetWheelPosition());
+                return true;
+            }
+
+            while (_checkpoint.SparkOutElapsedSeconds < totalSeconds)
+            {
+                if (_fastForwardRequested)
+                {
+                    _checkpoint.SparkOutElapsedSeconds = totalSeconds;
+                    break;
+                }
+
+                await AwaitRunGateAsync(cancellationToken).ConfigureAwait(false);
+                ThrowIfTorqueAccident();
+                await ThrowIfOverloadExceededAsync(progress, cancellationToken).ConfigureAwait(false);
+
+                var sliceStart = DateTime.UtcNow;
+                await Task.Delay(100, cancellationToken).ConfigureAwait(false);
+                _checkpoint.SparkOutElapsedSeconds += (DateTime.UtcNow - sliceStart).TotalSeconds;
+
+                var elapsed = Math.Min(_checkpoint.SparkOutElapsedSeconds, totalSeconds);
+                var phaseProgress = Math.Min(1, elapsed / totalSeconds);
+                ReportPhaseProgressForDebug(
+                    progress,
+                    weights,
+                    TableRepairWorkflowStep.SparkOut,
+                    phaseProgress,
+                    100,
+                    GetWheelPosition(),
+                    GetWheelPosition());
+            }
+
+            _checkpoint.SparkOutElapsedSeconds = totalSeconds;
+            Logs.LogInfo(
+                $"[SelfGrind-Overload] SparkOut done elapsed={totalSeconds:F1}/{totalSeconds:F1} pos={GetWheelPosition():F0}");
+            ReportPhaseProgressForDebug(
+                progress,
+                weights,
+                TableRepairWorkflowStep.SparkOut,
+                1,
+                100,
+                GetWheelPosition(),
+                GetWheelPosition());
+            return true;
+        }
+
+        private async Task<bool> ExecuteEscapePhaseAsync(
+            ITableRepairWorkflowProgress progress,
+            SelfGrindPhaseWeights weights,
+            CancellationToken cancellationToken)
+        {
+            var phaseStarted = DateTime.UtcNow;
+            _wheelMove.Reset();
+
+            var config = _checkpoint.Request.Config;
+            var escapeSpeed = config.EscapeSpeed > 0 ? config.EscapeSpeed : 1;
+            var escapeDistance = config.EscapeDistance > 0 ? config.EscapeDistance : 5;
+            _checkpoint.MoveSegmentStartUm = GetWheelPosition();
+            _checkpoint.EscapeTargetUm = _checkpoint.MoveSegmentStartUm - escapeDistance;
+
+            var target = _checkpoint.EscapeTargetUm;
+            TryApplyDebugMoveOverride(ref target, ref escapeSpeed);
+            _checkpoint.EscapeTargetUm = target;
+            _lastWheelPositionUm = GetWheelPosition();
+            var startPos = _checkpoint.MoveSegmentStartUm;
+
+            Logs.LogInfo(
+                $"[SelfGrind-Overload] Escape enter startPos={startPos:F3} target={target:F3} speed={escapeSpeed:F3}um/s distance={escapeDistance:F3}um");
+
+            if (!await _wheelMove.TickMoveUntilAsync(
+                target,
+                escapeSpeed,
+                () => AwaitRunGateAsync(cancellationToken),
+                ThrowIfTorqueAccident,
+                async () =>
+                {
+                    await ThrowIfOverloadExceededAsync(progress, cancellationToken).ConfigureAwait(false);
+                    var phaseProgress = CalculateMovePhaseProgress(
+                        _checkpoint.MoveSegmentStartUm,
+                        target,
+                        GetWheelPosition());
+                    ReportPhaseProgressForDebug(
+                        progress,
+                        weights,
+                        TableRepairWorkflowStep.Escape,
+                        phaseProgress,
+                        0,
+                        target,
+                        _checkpoint.MoveSegmentStartUm);
+                },
+                cancellationToken,
+                TableRepairWheelMoveController.PositionToleranceUm,
+                enableStallDetection: true,
+                shouldAbortEarly: () => _fastForwardRequested).ConfigureAwait(false))
+            {
+                return false;
+            }
+
+            var finalPos = GetWheelPosition();
+            Logs.LogInfo(
+                $"[SelfGrind-SpinStop] Escape done spindleTableStillRunning={_checkpoint.SpindleAndTableRunning} " +
+                $"finalPos={finalPos:F3} next=WheelHome");
+            Logs.LogInfo(
+                $"[SelfGrind-Overload] Escape done finalPos={finalPos:F3} deltaUm={finalPos - startPos:F3} elapsedMs={(DateTime.UtcNow - phaseStarted).TotalMilliseconds:F0}");
+
+            ReportPhaseProgressForDebug(
+                progress,
+                weights,
+                TableRepairWorkflowStep.Escape,
+                1,
+                0,
+                target,
+                _checkpoint.MoveSegmentStartUm);
+            return true;
+        }
+
+        private async Task<bool> ExecuteWheelHomePhaseAsync(
+            ITableRepairWorkflowProgress progress,
+            SelfGrindPhaseWeights weights,
+            CancellationToken cancellationToken)
+        {
+            var phaseStarted = DateTime.UtcNow;
+
+            await _controlCard.StopAxisAsync(AxisType.Wheel).ConfigureAwait(false);
+            _wheelMove.Reset();
+
+            _checkpoint.MoveSegmentStartUm = GetWheelPosition();
+            _lastWheelPositionUm = _checkpoint.MoveSegmentStartUm;
+            _wheelHomeMidpointStopped = false;
+            var homingStartUm = _checkpoint.MoveSegmentStartUm;
+            var midpointUm = homingStartUm / 2.0;
+            var homeTolerance = TableRepairWheelMoveController.HomePositionToleranceUm;
+            var homeConfig = _checkpoint.Request?.Config;
+            _lastWheelHomeOverloadLogUtc = DateTime.MinValue;
+            _lastSpinStopTickLogUtc = DateTime.MinValue;
+            _lastSpinStopLoggedPos = double.NaN;
+            Logs.LogInfo(
+                $"[SelfGrind-SpinStop] WheelHome enter homingStartUm={homingStartUm:F0} midpointUm={midpointUm:F0} " +
+                $"tolerance={homeTolerance:F0} spindleTableRunning={_checkpoint.SpindleAndTableRunning} path=NormalHoming50");
+            Logs.LogInfo(
+                $"[SelfGrind-Home] ExecuteWheelHomePhaseAsync enter step=WheelHome pos={_checkpoint.MoveSegmentStartUm:F3} stopRequested={_stopRequested} " +
+                $"wheelLimit={homeConfig?.WheelOverloadLimit ?? 0:F1} tableLimit={homeConfig?.TableOverloadLimit ?? 0:F1} spindleRunning={_checkpoint.SpindleAndTableRunning}");
+
+            if (!await _wheelMove.TickHomeUntilAsync(
+                () => AwaitRunGateAsync(cancellationToken),
+                ThrowIfTorqueAccident,
+                async () =>
+                {
+                    MaybeLogWheelHomeOverloadTelemetry(homeConfig);
+                    await ThrowIfOverloadExceededAsync(progress, cancellationToken).ConfigureAwait(false);
+                    var currentPos = GetWheelPosition();
+                    await TryStopSpindleAndTableAtHomingMidpointAsync(
+                        homingStartUm,
+                        currentPos,
+                        ref _wheelHomeMidpointStopped,
+                        "NormalHoming50").ConfigureAwait(false);
+                    MaybeLogWheelHomeSpinStopTick(homingStartUm, currentPos, midpointUm);
+                    var phaseProgress = homingStartUm != 0
+                        ? Math.Min(1, Math.Abs(homingStartUm - currentPos) / Math.Abs(homingStartUm))
+                        : 1;
+                    ReportWeightedProgress(progress, weights, TableRepairWorkflowStep.WheelHome, phaseProgress, 100);
+                },
+                cancellationToken).ConfigureAwait(false))
+            {
+                Logs.LogError("[SelfGrind-Home] ExecuteWheelHomePhaseAsync failed: wheel homing did not complete.");
+                return false;
+            }
+
+            await EnsureSpindleStoppedAfterReturnPhaseAsync(
+                nameof(ExecuteWheelHomePhaseAsync),
+                _wheelHomeMidpointStopped).ConfigureAwait(false);
+
+            ReportWeightedProgress(progress, weights, TableRepairWorkflowStep.WheelHome, 1, 100);
+            ScheduleCoolantOffAfterHomingAsync();
+
+            var finalPos = GetWheelPosition();
+            Logs.LogInfo(
+                $"[SelfGrind-SpinStop] WheelHome exit midpointStopped={_wheelHomeMidpointStopped} " +
+                $"spindleTableRunning={_checkpoint.SpindleAndTableRunning} finalPos={finalPos:F3}");
+            Logs.LogInfo(
+                $"[SelfGrind-Home] ExecuteWheelHomePhaseAsync exit step=WheelHome finalPos={finalPos:F3} elapsedMs={(DateTime.UtcNow - phaseStarted).TotalMilliseconds:F0}");
+            return true;
+        }
+
+        private async Task AwaitRunGateAsync(CancellationToken cancellationToken)
+        {
+            var wasPaused = false;
+
+            while (_pauseRequested && !_stopRequested)
+            {
+                if (!wasPaused)
+                {
+                    LogDebugInfo($"AwaitRunGate waiting step={_checkpoint?.Step}");
+                }
+
+                wasPaused = true;
+                cancellationToken.ThrowIfCancellationRequested();
+                await Task.Delay(100, cancellationToken).ConfigureAwait(false);
+            }
+
+            ThrowIfStopRequested();
+
+            if (wasPaused)
+            {
+                LogDebugInfo($"AwaitRunGate resumed step={_checkpoint?.Step}");
+            }
+
+            if (wasPaused
+                && ShouldResumeSpindleAndTable()
+                && !_checkpoint.SpindleAndTableRunning)
+            {
+                if (!await StartSpindleAndTableAsync(_checkpoint.Request.Config, cancellationToken).ConfigureAwait(false))
+                {
+                    throw new InvalidOperationException("Failed to restart spindle and table after pause.");
+                }
+
+                _checkpoint.SpindleAndTableRunning = true;
+            }
+        }
+
+        private async Task EnterPauseAsync()
+        {
+            LogDebugInfo($"EnterPauseAsync step={_checkpoint?.Step}");
+            _wheelMove.Reset();
+
+            try
+            {
+                await _controlCard.StopAxisAsync(AxisType.Table).ConfigureAwait(false);
+                await _controlCard.StopAxisAsync(AxisType.Wheel).ConfigureAwait(false);
+                await _inventerService.FreeStopAsync(false).ConfigureAwait(false);
+                _checkpoint.SpindleAndTableRunning = false;
+            }
+            catch (Exception ex)
+            {
+                Logs.LogWarning($"Self-Grind pause motion warning: {ex.Message}");
+            }
+
+            IsPaused = true;
+        }
+
+        private async Task<bool> EnsureSpindleAndTableRunningAsync(
+            CancellationToken cancellationToken,
+            bool reportFailure = true)
+        {
+            if (_checkpoint.SpindleAndTableRunning)
+            {
+                return true;
+            }
+
+            if (!await StartSpindleAndTableAsync(_checkpoint.Request.Config, cancellationToken).ConfigureAwait(false))
+            {
+                if (reportFailure)
+                {
+                    var msg = "主轴/转台启动失败（频率未到位或驱动异常）。";
+                    ReportWorkflowError(_workflowProgress, msg);
+                }
+
+                return false;
+            }
+
+            _checkpoint.SpindleAndTableRunning = true;
+            return true;
+        }
+
+        private void ThrowIfStopRequested()
+        {
+            if (_stopRequested)
+            {
+                throw new OperationCanceledException("Self-Grind stop requested.");
+            }
+        }
+
+        private async Task<TableRepairOutcome> HandleFailureAsync(ITableRepairWorkflowProgress progress)
+        {
+            var msg = _pendingWorkflowErrorMessage;
+            if (string.IsNullOrWhiteSpace(msg))
+            {
+                msg = $"阶段执行失败（Step={_checkpoint?.Step}）。";
+            }
+
+            _pendingWorkflowErrorMessage = null;
+            ReportWorkflowError(progress, msg);
+            progress?.ReportPhase("失败");
+            await StopMotionAndHomeAsync().ConfigureAwait(false);
+            progress?.ReportEndPosition(GetWheelPosition());
+            return TableRepairOutcome.Failed;
+        }
+
+        private static double CalculateMovePhaseProgress(
+            double startPosition,
+            double targetPosition,
+            double currentPosition)
+        {
+            var totalDistance = Math.Abs(targetPosition - startPosition);
+            if (totalDistance <= 0)
+            {
+                return 1;
+            }
+
+            var traveled = Math.Abs(currentPosition - startPosition);
+            return Math.Min(1, traveled / totalDistance);
+        }
+
+        private void ReportWeightedProgress(
+            ITableRepairWorkflowProgress progress,
+            SelfGrindPhaseWeights weights,
+            TableRepairWorkflowStep step,
+            double phaseProgress01,
+            double processProgress)
+        {
+            var total = weights.Total;
+            if (total <= 0)
+            {
+                total = 100;
+            }
+
+            var currentWeight = weights.WeightFor(step);
+            var overall = (_checkpoint.CompletedWeightRatio * total + currentWeight * phaseProgress01) / total * 100;
+            progress?.ReportProgress(Math.Min(100, overall), processProgress);
+        }
+
+        private bool ValidatePreconditions(TableRepairRequest request, out string errorMessage)
+        {
+            errorMessage = null;
+
+            if (!_controlCard.Initialized)
+            {
+                errorMessage = "控制卡未初始化，无法运动。";
+                Logs.LogError($"[SelfGrind] ValidatePreconditions: {errorMessage}");
+                return false;
+            }
+
+            if (IsDebugRequest(request))
+            {
+                LogDebugInfo("ValidatePreconditions skipped (Debug mode, control card OK)");
+                return true;
+            }
+
+            if (ShouldEnforceRuntimeInterlocks()
+                && !_inventerService.IsHandwareDemoPlatForm
+                && !_controlCard.IsSafetyDoorFullyClosed)
+            {
+                errorMessage = "安全门未关闭。";
+                Logs.LogError($"[SelfGrind] ValidatePreconditions: {errorMessage}");
+                return false;
+            }
+
+            if (request.GrindAmount <= 0)
+            {
+                errorMessage = "研磨量无效。";
+                Logs.LogError($"[SelfGrind] ValidatePreconditions: {errorMessage}");
+                return false;
+            }
+
+            if (request.B >= request.A)
+            {
+                errorMessage = "B 必须小于 A（数值越大越远离主轴）。";
+                Logs.LogError($"[SelfGrind] ValidatePreconditions: {errorMessage} A={request.A:F0} B={request.B:F0}");
+                return false;
+            }
+
+            var buffer = ResolveSafetyEndBuffer(request.Config);
+            var offset = ResolveRapidApproachOffset(request.Config);
+            var rapidEnd = request.B - buffer - offset;
+            var startC = GetWheelPosition();
+            if (startC >= rapidEnd)
+            {
+                errorMessage =
+                    "主轴位置须高于快进终点才能开始（当前 Z 须小于 B − SafetyEndBuffer − RapidApproachOffset）。";
+                Logs.LogError(
+                    $"[SelfGrind] ValidatePreconditions: {errorMessage} Z={startC:F0} rapidEnd={rapidEnd:F0} B={request.B:F0} buffer={buffer:F0} offset={offset:F0}");
+                return false;
+            }
+
+            return true;
+        }
+
+        private async Task<bool> StartSpindleAndTableAsync(
+            SelfGrindConfig config,
+            CancellationToken cancellationToken,
+            bool skipFrequencyWait = false)
+        {
+            LogSpindleTelemetry("start-before");
+            await PrepareInventerPdoWriteWindowAsync(cancellationToken).ConfigureAwait(false);
+
+            await TryWriteInventerParameterAsync(
+                () => _inventerService.SetAcceTimeAsync(20),
+                "AcceTime",
+                20).ConfigureAwait(false);
+            await TryWriteInventerParameterAsync(
+                () => _inventerService.SetDeceTimeAsync(20),
+                "DeceTime",
+                20).ConfigureAwait(false);
+
+            var wheelRpm = ResolveWheelRpm(config);
+            await TryWriteInventerParameterAsync(
+                () => _inventerService.SetRPMAsync(wheelRpm),
+                "SetRPM",
+                (uint)Math.Max(0, wheelRpm)).ConfigureAwait(false);
+            await TryWriteInventerParameterAsync(
+                () => _inventerService.RunForwardAsync(),
+                "RunForward",
+                0).ConfigureAwait(false);
+
+            _controlCard.SetSpeed(AxisType.Table, ResolveTableRpm(config));
+            await _controlCard.MoveContinueAsync(AxisType.Table, MoveDirection.正向, cancellationToken).ConfigureAwait(false);
+
+            if (!skipFrequencyWait && IsDebugMode() && !_inventerService.FrequencyReached)
+            {
+                LogDebugInfo("Debug mode: spindle frequency not reached, continuing without wait");
+            }
+
+            LogSpindleTelemetry("start-after");
+            return true;
+        }
+
+        private async Task PrepareInventerPdoWriteWindowAsync(CancellationToken cancellationToken)
+        {
+            if (_inventerService.IsHandwareDemoPlatForm || !_controlCard.Initialized)
+            {
+                return;
+            }
+
+            await Task.Delay(SpindlePdoSettleDelayMs, cancellationToken).ConfigureAwait(false);
+
+            if (!IsWheelAxisBusyForPdo())
+            {
+                return;
+            }
+
+            Logs.LogInfo("[SelfGrind] Wheel motion active before spindle PDO write; waiting for quiet window.");
+            var elapsed = 0;
+            while (elapsed < SpindlePdoWheelQuietTimeoutMs && IsWheelAxisBusyForPdo())
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                await Task.Delay(SpindlePdoWheelQuietPollMs, cancellationToken).ConfigureAwait(false);
+                elapsed += SpindlePdoWheelQuietPollMs;
+            }
+
+            if (IsWheelAxisBusyForPdo())
+            {
+                Logs.LogWarning(
+                    $"[SelfGrind] Wheel still active after {SpindlePdoWheelQuietTimeoutMs}ms; " +
+                    "using extended PDO write retries during motion.");
+            }
+            else
+            {
+                Logs.LogInfo($"[SelfGrind] PDO quiet window ready after {elapsed}ms wait.");
+            }
+        }
+
+        private bool IsWheelAxisBusyForPdo()
+        {
+            var wheelIndex = (int)AxisType.Wheel;
+            if (_controlCard.ServoDatas == null || _controlCard.ServoDatas.Count <= wheelIndex)
+            {
+                return false;
+            }
+
+            var wheel = _controlCard.ServoDatas[wheelIndex];
+            return wheel.IsMoving || Math.Abs(wheel.ActualVelocity) > SpindlePdoWheelQuietVelocityThreshold;
+        }
+
+        private (int maxAttempts, int retryDelayMs) GetInventerWriteRetryPolicy()
+        {
+            if (IsWheelAxisBusyForPdo())
+            {
+                return (SpindleParameterWriteMaxAttemptsDuringMotion, SpindleParameterWriteRetryDelayDuringMotionMs);
+            }
+
+            return (SpindleParameterWriteMaxAttempts, SpindleParameterWriteRetryDelayMs);
+        }
+
+        private async Task<bool> TryWriteInventerParameterAsync(
+            Func<Task<bool>> writeAsync,
+            string parameterName,
+            uint attemptedValue)
+        {
+            var (maxAttempts, retryDelayMs) = GetInventerWriteRetryPolicy();
+            for (var attempt = 1; attempt <= maxAttempts; attempt++)
+            {
+                if (await writeAsync().ConfigureAwait(false))
+                {
+                    if (attempt > 1)
+                    {
+                        Logs.LogInfo(
+                            $"[SelfGrind] Spindle {parameterName} write succeeded on attempt {attempt}/{maxAttempts}.");
+                    }
+
+                    return true;
+                }
+
+                Logs.LogWarning(
+                    $"[SelfGrind] Spindle {parameterName} write failed attempt {attempt}/{maxAttempts} value={attemptedValue}.");
+                if (attempt < maxAttempts)
+                {
+                    await Task.Delay(retryDelayMs * attempt).ConfigureAwait(false);
+                }
+            }
+
+            Logs.LogWarning(
+                $"[SelfGrind] Spindle {parameterName} write failed after {maxAttempts} attempts; continuing startup.");
+            return false;
+        }
+
+        private void LogSpindleTelemetry(string phase)
+        {
+            var outputHz = _inventerService.CurrentFrequency;
+            Logs.LogInfo(
+                $"[SelfGrind-Spindle] {phase} running={_inventerService.IsRunning} " +
+                $"frequencyReached={_inventerService.FrequencyReached} " +
+                $"outputHz={outputHz:F2} rpm={outputHz / 0.04:F0} fault={_inventerService.HasFault}");
+        }
+
+        private void LogSpindleTableTelemetry(string phase)
+        {
+            LogSpindleTelemetry(phase);
+
+            var config = _checkpoint?.Request?.Config;
+            var targetWheelRpm = config != null ? ResolveWheelRpm(config) : 0;
+            var targetTableRpm = config != null ? ResolveTableRpm(config) : 0;
+            var tableIndex = (int)AxisType.Table;
+            if (_controlCard.ServoDatas == null || _controlCard.ServoDatas.Count <= tableIndex)
+            {
+                return;
+            }
+
+            var table = _controlCard.ServoDatas[tableIndex];
+            Logs.LogInfo(
+                $"[SelfGrind-Spindle] {phase} targetWheelRpm={targetWheelRpm:F0} " +
+                $"tableMoving={table.IsMoving} tableActualRpm={table.ActualVelocity:F0} targetTableRpm={targetTableRpm:F0}");
+        }
+
+        private bool ShouldApplySafetyPhaseEndTargetSpeedVerify()
+        {
+            return _checkpoint?.Request?.RunMode == TableRepairRunMode.Normal
+                && !_inventerService.IsHandwareDemoPlatForm;
+        }
+
+        private bool IsSpindleAtTargetSpeed(SelfGrindConfig config)
+        {
+            if (_inventerService.IsHandwareDemoPlatForm || config == null)
+            {
+                return false;
+            }
+
+            if (_inventerService.FrequencyReached)
+            {
+                return true;
+            }
+
+            var targetHz = ResolveWheelRpm(config) * 0.04;
+            var minHz = targetHz * (1 - SpindleTargetSpeedToleranceRatio);
+            return _inventerService.CurrentFrequency >= minHz;
+        }
+
+        private bool IsTableAtTargetSpeed(SelfGrindConfig config)
+        {
+            if (config == null)
+            {
+                return false;
+            }
+
+            var tableIndex = (int)AxisType.Table;
+            if (_controlCard.ServoDatas == null || _controlCard.ServoDatas.Count <= tableIndex)
+            {
+                return false;
+            }
+
+            var table = _controlCard.ServoDatas[tableIndex];
+            if (!table.IsMoving)
+            {
+                return false;
+            }
+
+            var targetRpm = ResolveTableRpm(config);
+            var tolerance = Math.Max(targetRpm * TableTargetSpeedToleranceRatio, TableTargetSpeedMinToleranceRpm);
+            return Math.Abs(table.ActualVelocity - targetRpm) <= tolerance;
+        }
+
+        private static string BuildTargetSpeedVerifyFailureMessage(bool spindleOk, bool tableOk)
+        {
+            if (!spindleOk && !tableOk)
+            {
+                return "安全阶段结束：主轴与工作台均未达设定转速，已中止并回零。";
+            }
+
+            if (!spindleOk)
+            {
+                return "安全阶段结束：主轴未达设定转速，已中止并回零。";
+            }
+
+            return "安全阶段结束：工作台未达设定转速，已中止并回零。";
+        }
+
+        private async Task<bool> VerifySpindleAndTableAtTargetSpeedAtPhaseEndAsync(
+            ITableRepairWorkflowProgress progress,
+            string phaseLabel,
+            CancellationToken cancellationToken)
+        {
+            if (!ShouldApplySafetyPhaseEndTargetSpeedVerify())
+            {
+                return true;
+            }
+
+            var config = _checkpoint?.Request?.Config;
+            if (config == null)
+            {
+                return true;
+            }
+
+            var targetWheelRpm = ResolveWheelRpm(config);
+            var targetTableRpm = ResolveTableRpm(config);
+            const int checkIntervalMs = 100;
+            var elapsed = 0;
+            var spindleOk = false;
+            var tableOk = false;
+
+            while (elapsed <= InventerFrequencyReachedTimeoutMs)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+
+                spindleOk = IsSpindleAtTargetSpeed(config);
+                tableOk = IsTableAtTargetSpeed(config);
+                if (spindleOk && tableOk)
+                {
+                    LogSpindleTableTelemetry($"{phaseLabel}-verify-passed");
+                    Logs.LogInfo(
+                        $"[SelfGrind] {phaseLabel} target-speed verify passed elapsed={elapsed}ms " +
+                        $"targetSpindleRpm={targetWheelRpm:F0} targetTableRpm={targetTableRpm:F0}");
+                    _pendingWorkflowErrorMessage = null;
+                    return true;
+                }
+
+                if (elapsed >= InventerFrequencyReachedTimeoutMs)
+                {
+                    break;
+                }
+
+                await Task.Delay(checkIntervalMs, cancellationToken).ConfigureAwait(false);
+                elapsed += checkIntervalMs;
+            }
+
+            LogSpindleTableTelemetry($"{phaseLabel}-verify-failed");
+            Logs.LogWarning(
+                $"[SelfGrind] {phaseLabel} target-speed verify failed elapsed={elapsed}ms " +
+                $"spindleOk={spindleOk} tableOk={tableOk} targetSpindleRpm={targetWheelRpm:F0} targetTableRpm={targetTableRpm:F0}");
+
+            _pendingWorkflowErrorMessage = BuildTargetSpeedVerifyFailureMessage(spindleOk, tableOk);
+            if (_checkpoint != null)
+            {
+                _checkpoint.SpindleAndTableRunning = spindleOk && tableOk;
+            }
+
+            return false;
+        }
+
+        private bool ShouldEnforceOverloadLimits()
+        {
+            return !IsDebugMode();
+        }
+
+        private static bool IsSuspectOverloadReading(double pct)
+        {
+            return pct <= -0.5 || Math.Abs(pct) > SuspectOverloadReadingThreshold;
+        }
+
+        private void LogSuspectOverloadReadingIfNeeded(string context)
+        {
+            var wheel = GetWheelOverloadPercent();
+            if (IsSuspectOverloadReading(wheel))
+            {
+                Logs.LogWarning($"[SelfGrind-Overload] suspect reading axis=Wheel value={wheel:F1} {context}");
+            }
+
+            var table = GetTableOverloadPercent();
+            if (IsSuspectOverloadReading(table))
+            {
+                Logs.LogWarning($"[SelfGrind-Overload] suspect reading axis=Table value={table:F1} {context}");
+            }
+        }
+
+        private void MaybeLogWheelHomeOverloadTelemetry(SelfGrindConfig config)
+        {
+            if (config == null)
+            {
+                return;
+            }
+
+            var wheelPct = GetWheelOverloadPercent();
+            var tablePct = GetTableOverloadPercent();
+            var wheelThreshold = config.WheelOverloadLimit > 0 ? config.WheelOverloadLimit * 0.8 : 0;
+            var tableThreshold = config.TableOverloadLimit > 0 ? config.TableOverloadLimit * 0.8 : 0;
+            var now = DateTime.UtcNow;
+            var shouldLog = wheelPct > wheelThreshold
+                || tablePct > tableThreshold
+                || Math.Abs(tablePct) > tableThreshold
+                || (now - _lastWheelHomeOverloadLogUtc).TotalMilliseconds >= WheelHomeOverloadLogIntervalMs;
+
+            if (!shouldLog)
+            {
+                return;
+            }
+
+            _lastWheelHomeOverloadLogUtc = now;
+            var pos = GetWheelPosition();
+            LogSuspectOverloadReadingIfNeeded($"WheelHome tick pos={pos:F0}");
+            Logs.LogInfo(
+                $"[SelfGrind-Overload] WheelHome tick pos={pos:F0} wheel={wheelPct:F1}/{config.WheelOverloadLimit:F1} " +
+                $"table={tablePct:F1}/{config.TableOverloadLimit:F1} spindleRunning={_checkpoint?.SpindleAndTableRunning ?? false}");
+        }
+
+        private bool TryGetOverloadExceeded(SelfGrindConfig config, out bool wheelExceeded, out bool tableExceeded)
+        {
+            wheelExceeded = IsWheelOverloadExceeded(config.WheelOverloadLimit);
+            tableExceeded = IsTableOverloadExceeded(config.TableOverloadLimit);
+            return wheelExceeded || tableExceeded;
+        }
+
+        private async Task ThrowIfOverloadExceededAsync(
+            ITableRepairWorkflowProgress progress,
+            CancellationToken cancellationToken)
+        {
+            if (_overloadHomingTriggered || !ShouldEnforceOverloadLimits())
+            {
+                return;
+            }
+
+            var config = _checkpoint?.Request?.Config;
+            if (config == null || !TryGetOverloadExceeded(config, out var wheelExceeded, out var tableExceeded))
+            {
+                return;
+            }
+
+            var step = _checkpoint?.Step.ToString() ?? "unknown";
+            var pos = GetWheelPosition();
+            var wheelPct = GetWheelOverloadPercent();
+            var tablePct = GetTableOverloadPercent();
+            LogSuspectOverloadReadingIfNeeded($"check step={step} pos={pos:F0}");
+            Logs.LogError(
+                $"[SelfGrind-Overload] check step={step} pos={pos:F0} wheel={wheelPct:F1}/{config.WheelOverloadLimit:F1} we={wheelExceeded} " +
+                $"table={tablePct:F1}/{config.TableOverloadLimit:F1} te={tableExceeded} spindleRunning={_checkpoint?.SpindleAndTableRunning ?? false}");
+
+            await HandleOverloadExceededAsync(progress, wheelExceeded, tableExceeded)
+                .ConfigureAwait(false);
+            throw new OverloadLimitExceededException(wheelExceeded, tableExceeded);
+        }
+
+        private async Task HandleOverloadExceededAsync(
+            ITableRepairWorkflowProgress progress,
+            bool wheelExceeded,
+            bool tableExceeded)
+        {
+            _overloadHomingTriggered = true;
+            _overloadMidpointSpindleStopped = false;
+
+            var spindleRunningBefore = _checkpoint?.SpindleAndTableRunning ?? false;
+            var willRestartSpindle = _checkpoint != null && !spindleRunningBefore;
+            var wheelBefore = GetWheelOverloadPercent();
+            var tableBefore = GetTableOverloadPercent();
+            var posBeforeStop = GetWheelPosition();
+            Logs.LogError(
+                $"[SelfGrind-Overload] snapshot beforeStop wheel={wheelBefore:F1} table={tableBefore:F1} " +
+                $"spindleRunning={spindleRunningBefore} pos={posBeforeStop:F0} willRestartSpindle={willRestartSpindle}");
+
+            await _controlCard.StopAxisAsync(AxisType.Wheel).ConfigureAwait(false);
+            _wheelMove.Reset();
+
+            var wheelAfter = GetWheelOverloadPercent();
+            var tableAfter = GetTableOverloadPercent();
+            Logs.LogError(
+                $"[SelfGrind-Overload] snapshot afterStop wheel={wheelAfter:F1} table={tableAfter:F1} " +
+                $"spindleRunning={_checkpoint?.SpindleAndTableRunning ?? false} pos={GetWheelPosition():F0}");
+
+            var config = _checkpoint?.Request?.Config;
+            var step = _checkpoint?.Step.ToString() ?? "unknown";
+            var wheelPct = GetWheelOverloadPercent();
+            var tablePct = GetTableOverloadPercent();
+            var wheelLimit = config?.WheelOverloadLimit ?? 0;
+            var tableLimit = config?.TableOverloadLimit ?? 0;
+            var rapidMidpointPassed = _checkpoint?.RapidMidpointPassed ?? false;
+            Logs.LogError(
+                $"[SelfGrind-Overload] triggered step={step} wheelExceeded={wheelExceeded} wheel={wheelPct:F1}% limit={wheelLimit:F1}% " +
+                $"tableExceeded={tableExceeded} table={tablePct:F1}% limit={tableLimit:F1}% rapidMidpointPassed={rapidMidpointPassed}");
+
+            var overloadMsg = BuildOverloadMessage(wheelExceeded, tableExceeded);
+            Logs.LogError($"[SelfGrind-Overload] {overloadMsg}");
+            ReportWorkflowError(progress, overloadMsg);
+            progress?.ReportOverloadAlert(wheelExceeded, tableExceeded);
+            progress?.ReportPhase("回零");
+
+            if (_checkpoint != null && !_checkpoint.SpindleAndTableRunning)
+            {
+                if (!_checkpoint.RapidMidpointPassed)
+                {
+                    Logs.LogInfo("[SelfGrind-Overload] pre-rapid-midpoint spindle start for overload homing.");
+                }
+
+                if (config != null
+                    && await StartSpindleAndTableAsync(
+                        config,
+                        CancellationToken.None,
+                        skipFrequencyWait: true).ConfigureAwait(false))
+                {
+                    _checkpoint.SpindleAndTableRunning = true;
+                }
+                else
+                {
+                    Logs.LogWarning("[SelfGrind-Overload] spindle/table start failed; continuing overload homing.");
+                }
+            }
+
+            _overloadHomingStartUm = GetWheelPosition();
+            Logs.LogInfo(
+                $"[SelfGrind-Overload] homing start pos={_overloadHomingStartUm:F0} speed={OverloadHomingSpeedUmS:F0}um/s midpoint={_overloadHomingStartUm / 2.0:F0}");
+
+            var homeOk = await _wheelMove.TickReturnToZeroUntilAsync(
+                OverloadHomingSpeedUmS,
+                () =>
+                {
+                    ThrowIfStopRequested();
+                    return Task.CompletedTask;
+                },
+                ThrowIfTorqueAccident,
+                async () =>
+                {
+                    await TryStopSpindleAndTableAtHomingMidpointAsync(
+                        _overloadHomingStartUm,
+                        GetWheelPosition(),
+                        ref _overloadMidpointSpindleStopped,
+                        "OverloadHoming50").ConfigureAwait(false);
+                },
+                CancellationToken.None).ConfigureAwait(false);
+
+            var finalPos = GetWheelPosition();
+            if (homeOk)
+            {
+                Logs.LogInfo(
+                    $"[SelfGrind-Overload] homing complete finalPos={finalPos:F0} midpointStopped={_overloadMidpointSpindleStopped}");
+            }
+            else
+            {
+                Logs.LogError(
+                    $"[SelfGrind-Overload] homing incomplete finalPos={finalPos:F0} midpointStopped={_overloadMidpointSpindleStopped}");
+            }
+
+            if (_checkpoint != null
+                && _checkpoint.SpindleAndTableRunning
+                && !_overloadMidpointSpindleStopped)
+            {
+                Logs.LogWarning(
+                    $"[SelfGrind-Overload] homing midpoint spindle stop not reached startUm={_overloadHomingStartUm:F0} finalPos={finalPos:F0}; force-stopping at phase end.");
+            }
+
+            await EnsureSpindleStoppedAfterReturnPhaseAsync().ConfigureAwait(false);
+            ScheduleCoolantOffAfterHomingAsync();
+        }
+
+        private static string BuildOverloadMessage(bool wheelExceeded, bool tableExceeded)
+        {
+            if (wheelExceeded && tableExceeded)
+            {
+                return "砂轮与工作台过载超限，已强制回零。";
+            }
+
+            if (wheelExceeded)
+            {
+                return "砂轮过载超限，已强制回零。";
+            }
+
+            return "工作台过载超限，已强制回零。";
+        }
+
+        private async Task TryStopSpindleAndTableAtHomingMidpointAsync(
+            double homingStartUm,
+            double currentPos,
+            ref bool midpointStoppedFlag,
+            string path)
+        {
+            if (_checkpoint == null || !_checkpoint.SpindleAndTableRunning || midpointStoppedFlag)
+            {
+                return;
+            }
+
+            var refPos = homingStartUm / 2.0;
+            var tolerance = TableRepairWheelMoveController.HomePositionToleranceUm;
+            if (currentPos <= refPos + tolerance)
+            {
+                await StopSpindleAndTableAsync().ConfigureAwait(false);
+                midpointStoppedFlag = true;
+                Logs.LogInfo(
+                    $"[SelfGrind-SpinStop] stopped at homing midpoint path={path} pos={currentPos:F0} ref={refPos:F0} homingStartUm={homingStartUm:F0}");
+            }
+        }
+
+        private void MaybeLogWheelHomeSpinStopTick(double homingStartUm, double currentPos, double midpointUm)
+        {
+            if (_wheelHomeMidpointStopped)
+            {
+                return;
+            }
+
+            var now = DateTime.UtcNow;
+            var deltaFromLast = double.IsNaN(_lastSpinStopLoggedPos)
+                ? double.MaxValue
+                : Math.Abs(currentPos - _lastSpinStopLoggedPos);
+            var throttleElapsed = (now - _lastSpinStopTickLogUtc).TotalMilliseconds;
+            if (throttleElapsed < SpinStopLogThrottleMs && deltaFromLast < SpinStopLogPositionDeltaUm)
+            {
+                return;
+            }
+
+            _lastSpinStopTickLogUtc = now;
+            _lastSpinStopLoggedPos = currentPos;
+            var progress = homingStartUm != 0
+                ? Math.Min(1, Math.Abs(homingStartUm - currentPos) / Math.Abs(homingStartUm))
+                : 1;
+            Logs.LogInfo(
+                $"[SelfGrind-SpinStop] WheelHome tick pos={currentPos:F0} progress={progress:P0} midpointUm={midpointUm:F0} untilStop=true");
+        }
+
+        private sealed class OverloadLimitExceededException : Exception
+        {
+            public OverloadLimitExceededException(bool wheelExceeded, bool tableExceeded)
+                : base(BuildOverloadMessage(wheelExceeded, tableExceeded))
+            {
+            }
+        }
+
+        private async Task EnsureCoolantOnAsync(CancellationToken cancellationToken)
+        {
+            if (!_controlCard.Initialized)
+            {
+                Logs.LogInfo("[SelfGrind] Coolant skipped (control card not initialized).");
+                return;
+            }
+
+            if (_checkpoint == null || _checkpoint.CoolantEnabled)
+            {
+                return;
+            }
+
+            await ExtendCoolantValvesAsync(cancellationToken).ConfigureAwait(false);
+            _checkpoint.CoolantEnabled = true;
+            Logs.LogInfo("[SelfGrind] Coolant valves extended (surface, turntable).");
+        }
+
+        private async Task<bool> TryExecuteRapidMidpointActionsAsync(
+            CancellationToken cancellationToken,
+            bool reportSpindleFailure = true)
+        {
+            if (_checkpoint == null || _checkpoint.RapidMidpointPassed)
+            {
+                return true;
+            }
+
+            if (!IsRapidMidpointReached())
+            {
+                return true;
+            }
+
+            if (_rapidMidpointActionsInProgress)
+            {
+                return true;
+            }
+
+            _rapidMidpointActionsInProgress = true;
+            try
+            {
+                await EnsureCoolantOnAsync(cancellationToken).ConfigureAwait(false);
+                if (!await EnsureSpindleAndTableRunningAsync(cancellationToken, reportSpindleFailure)
+                        .ConfigureAwait(false))
+                {
+                    return false;
+                }
+
+                _checkpoint.RapidMidpointPassed = true;
+                Logs.LogInfo(
+                    $"[SelfGrind] Rapid midpoint actions complete ref={_checkpoint.CoolantReferencePosition:F0}");
+                return true;
+            }
+            finally
+            {
+                _rapidMidpointActionsInProgress = false;
+            }
+        }
+
+        private bool IsRapidMidpointReached()
+        {
+            if (_checkpoint == null)
+            {
+                return false;
+            }
+
+            var current = GetWheelPosition();
+            var progress = CalculateMovePhaseProgress(
+                _checkpoint.MoveSegmentStartUm,
+                _checkpoint.RapidPosition,
+                current);
+            var elapsedMs = (int)(DateTime.UtcNow - _rapidSegmentStartedUtc).TotalMilliseconds;
+
+            if (!_coolantMidpointCheckLogged)
+            {
+                _coolantMidpointCheckLogged = true;
+                Logs.LogInfo(
+                    $"[SelfGrind] Rapid midpoint check: start={_checkpoint.MoveSegmentStartUm:F0} " +
+                    $"target={_checkpoint.RapidPosition:F0} current={current:F0} progress={progress:P0} " +
+                    $"elapsed={elapsedMs}ms half={_rapidCoolantHalfDelayMs}ms");
+            }
+
+            return progress >= 0.5 || elapsedMs >= _rapidCoolantHalfDelayMs;
+        }
+
+        private async Task TrackWheelPositionAndTryMidpointStopAsync()
+        {
+            var current = GetWheelPosition();
+            if (!double.IsNaN(_lastWheelPositionUm))
+            {
+                await TryStopSpindleAndTableAtMidpointReturnAsync(_lastWheelPositionUm, current)
+                    .ConfigureAwait(false);
+            }
+
+            _lastWheelPositionUm = current;
+        }
+
+        private async Task TryStopSpindleAndTableAtMidpointReturnAsync(double previousPos, double currentPos)
+        {
+            if (_checkpoint == null || !_checkpoint.RapidMidpointPassed || !_checkpoint.SpindleAndTableRunning)
+            {
+                return;
+            }
+
+            var refPos = _checkpoint.CoolantReferencePosition;
+            var tolerance = TableRepairWheelMoveController.HomePositionToleranceUm;
+            if (previousPos > refPos + tolerance && currentPos <= refPos + tolerance)
+            {
+                await StopSpindleAndTableAsync().ConfigureAwait(false);
+                Logs.LogInfo(
+                    $"[SelfGrind-SpinStop] stopped at rapid midpoint return path=GeoMidpoint " +
+                    $"pos={currentPos:F0} ref={refPos:F0}");
+            }
+        }
+
+        private async Task StopSpindleAndTableAsync([CallerMemberName] string caller = null)
+        {
+            if (_checkpoint == null)
+            {
+                return;
+            }
+
+            LogSpindleTelemetry("stop-before");
+            Logs.LogInfo(
+                $"[SelfGrind-SpinStop] StopSpindleAndTable caller={caller ?? "unknown"} " +
+                $"step={_checkpoint.Step} pos={GetWheelPosition():F0}");
+
+            try
+            {
+                await _controlCard.StopAxisAsync(AxisType.Table).ConfigureAwait(false);
+                if (!await _inventerService.FreeStopAsync(false).ConfigureAwait(false))
+                {
+                    Logs.LogError("[SelfGrind] Spindle FreeStopAsync command failed.");
+                }
+            }
+            catch (Exception ex)
+            {
+                Logs.LogWarning($"Self-Grind stop spindle/table warning: {ex.Message}");
+            }
+
+            _checkpoint.SpindleAndTableRunning = false;
+        }
+
+        private async Task EnsureSpindleStoppedAfterReturnPhaseAsync(
+            string caller = null,
+            bool? midpointStopped = null)
+        {
+            if (_checkpoint == null || !_checkpoint.SpindleAndTableRunning)
+            {
+                return;
+            }
+
+            if (midpointStopped == false)
+            {
+                Logs.LogWarning(
+                    $"[SelfGrind-SpinStop] fallback force-stop at phase end caller={caller ?? "unknown"} " +
+                    $"step={_checkpoint.Step} pos={GetWheelPosition():F0} midpointStopped=false");
+            }
+
+            await StopSpindleAndTableAsync(caller ?? nameof(EnsureSpindleStoppedAfterReturnPhaseAsync))
+                .ConfigureAwait(false);
+        }
+
+        private bool ShouldResumeSpindleAndTable()
+        {
+            if (_checkpoint == null || !_checkpoint.RapidMidpointPassed || _checkpoint.SpindleAndTableRunning)
+            {
+                return false;
+            }
+
+            var tolerance = TableRepairWheelMoveController.HomePositionToleranceUm;
+            var refPos = _checkpoint.CoolantReferencePosition;
+            var currentPos = GetWheelPosition();
+
+            switch (_checkpoint.Step)
+            {
+                case TableRepairWorkflowStep.Rapid:
+                    return _checkpoint.CoolantEnabled;
+                case TableRepairWorkflowStep.Safety:
+                case TableRepairWorkflowStep.Grind:
+                case TableRepairWorkflowStep.SparkOut:
+                case TableRepairWorkflowStep.Escape:
+                    return true;
+                case TableRepairWorkflowStep.WheelHome:
+                    return currentPos > refPos + tolerance;
+                default:
+                    return false;
+            }
+        }
+
+        private async Task ExtendCoolantValvesAsync(CancellationToken cancellationToken)
+        {
+            await ExtendCoolantValveAsync(CylinderType.SurfaceCleaningValve_Sol, cancellationToken)
+                .ConfigureAwait(false);
+            await ExtendCoolantValveAsync(CylinderType.TurntableCleaningValve_Sol, cancellationToken)
+                .ConfigureAwait(false);
+        }
+
+        private async Task ExtendCoolantValveAsync(CylinderType cylinderType, CancellationToken cancellationToken)
+        {
+            var cylinder = _cylinderManager.GetCylinder(cylinderType);
+            if (cylinder == null)
+            {
+                var msg = $"冷却液阀 {cylinderType} 未注册，无法开启。";
+                Logs.LogError($"[SelfGrind] {msg}");
+                ReportWorkflowError(_workflowProgress, msg);
+                throw new InvalidOperationException(msg);
+            }
+
+            if (!await cylinder.ExtendAsync(cancellationToken).ConfigureAwait(false))
+            {
+                var msg = $"冷却液阀 {cylinderType} 伸出失败。";
+                Logs.LogError($"[SelfGrind] {msg}");
+                ReportWorkflowError(_workflowProgress, msg);
+                throw new InvalidOperationException(msg);
+            }
+        }
+
+        private async Task StopMotionAndHomeAsync()
+        {
+            var entryPos = GetWheelPosition();
+            var step = _checkpoint?.Step.ToString() ?? "unknown";
+            Logs.LogInfo(
+                $"[SelfGrind-Home] StopMotionAndHomeAsync started step={step} pos={entryPos:F3} stopRequested={_stopRequested}");
+            var started = DateTime.UtcNow;
+            _wheelMove.Reset();
+
+            try
+            {
+                if (_checkpoint != null
+                    && _checkpoint.RapidMidpointPassed
+                    && _checkpoint.SpindleAndTableRunning)
+                {
+                    await HomeWheelWithMidpointSpindleStopAsync(CancellationToken.None).ConfigureAwait(false);
+                }
+                else
+                {
+                    await StopSpindleAndTableAsync().ConfigureAwait(false);
+                    await _controlCard.StopAxisAsync(AxisType.Wheel).ConfigureAwait(false);
+                    await _controlCard.MoveToZeroAsync(AxisType.Wheel).ConfigureAwait(false);
+                }
+
+                await EnsureSpindleStoppedAfterReturnPhaseAsync().ConfigureAwait(false);
+                ScheduleCoolantOffAfterHomingAsync();
+            }
+            catch (Exception ex)
+            {
+                Logs.LogWarning($"Self-Grind stop and home warning: {ex.Message}");
+                await StopSpindleAndTableAsync().ConfigureAwait(false);
+            }
+
+            Logs.LogInfo(
+                $"[SelfGrind-Home] StopMotionAndHomeAsync completed step={step} finalPos={GetWheelPosition():F3} elapsedMs={(DateTime.UtcNow - started).TotalMilliseconds:F0}");
+        }
+
+        private async Task StopMotionAndHomeForDebugAsync()
+        {
+            _wheelMove.Reset();
+
+            try
+            {
+                if (_checkpoint != null
+                    && _checkpoint.RapidMidpointPassed
+                    && _checkpoint.SpindleAndTableRunning)
+                {
+                    await HomeWheelWithMidpointSpindleStopAsync(CancellationToken.None).ConfigureAwait(false);
+                }
+                else
+                {
+                    await StopSpindleAndTableAsync().ConfigureAwait(false);
+                    await _controlCard.StopAxisAsync(AxisType.Wheel).ConfigureAwait(false);
+                    await _controlCard.MoveToZeroAsync(AxisType.Wheel).ConfigureAwait(false);
+                }
+
+                await EnsureSpindleStoppedAfterReturnPhaseAsync().ConfigureAwait(false);
+                ScheduleCoolantOffAfterHomingAsync();
+            }
+            catch (Exception ex)
+            {
+                Logs.LogWarning($"Self-Grind debug stop and home warning: {ex.Message}");
+                await StopSpindleAndTableAsync().ConfigureAwait(false);
+            }
+        }
+
+        private async Task HomeWheelWithMidpointSpindleStopAsync(CancellationToken cancellationToken)
+        {
+            await _controlCard.StopAxisAsync(AxisType.Wheel).ConfigureAwait(false);
+            _wheelMove.Reset();
+            var homingStartUm = GetWheelPosition();
+            _lastWheelPositionUm = homingStartUm;
+            Logs.LogInfo(
+                $"[SelfGrind-SpinStop] stop-homing enter path=GeoMidpoint homingStartUm={homingStartUm:F0} " +
+                $"coolantRef={_checkpoint?.CoolantReferencePosition:F0}");
+
+            await _wheelMove.TickHomeUntilAsync(
+                () => Task.CompletedTask,
+                () => { },
+                async () => await TrackWheelPositionAndTryMidpointStopAsync().ConfigureAwait(false),
+                cancellationToken).ConfigureAwait(false);
+        }
+
+        private Task ScheduleCoolantOffAfterHomingAsync()
+        {
+            if (_checkpoint == null || !_checkpoint.CoolantEnabled)
+            {
+                return Task.CompletedTask;
+            }
+
+            _coolantOffCts?.Cancel();
+            _coolantOffCts = new CancellationTokenSource();
+            var token = _coolantOffCts.Token;
+            _coolantOffTask = CoolantOffAfterHomingAsync(token);
+            return _coolantOffTask;
+        }
+
+        private async Task CoolantOffAfterHomingAsync(CancellationToken token)
+        {
+            try
+            {
+                await Task.Delay(CoolantOffDelayAfterHomingMs, token).ConfigureAwait(false);
+                if (!await RetractCoolantValvesAsync().ConfigureAwait(false))
+                {
+                    Logs.LogWarning("[SelfGrind] Coolant valves retract incomplete after homing delay.");
+                    return;
+                }
+
+                if (_checkpoint != null)
+                {
+                    _checkpoint.CoolantEnabled = false;
+                }
+
+                Logs.LogInfo("[SelfGrind] Coolant valves retracted after homing delay.");
+            }
+            catch (OperationCanceledException)
+            {
+            }
+            catch (Exception ex)
+            {
+                Logs.LogWarning($"Self-Grind coolant off warning: {ex.Message}");
+            }
+        }
+
+        private async Task<bool> RetractCoolantValvesAsync()
+        {
+            if (!_controlCard.Initialized)
+            {
+                Logs.LogWarning("[SelfGrind] Coolant retract skipped (control card not initialized).");
+                return false;
+            }
+
+            var surfaceOk = await RetractCoolantValveAsync(CylinderType.SurfaceCleaningValve_Sol)
+                .ConfigureAwait(false);
+            var turntableOk = await RetractCoolantValveAsync(CylinderType.TurntableCleaningValve_Sol)
+                .ConfigureAwait(false);
+            return surfaceOk && turntableOk;
+        }
+
+        private async Task<bool> RetractCoolantValveAsync(CylinderType cylinderType)
+        {
+            var cylinder = _cylinderManager.GetCylinder(cylinderType);
+            if (cylinder == null)
+            {
+                var msg = $"冷却液阀 {cylinderType} 未注册，无法关闭。";
+                Logs.LogError($"[SelfGrind] {msg}");
+                ReportWorkflowError(_workflowProgress, msg);
+                return false;
+            }
+
+            if (!await cylinder.RetractAsync(CancellationToken.None).ConfigureAwait(false))
+            {
+                var msg = $"冷却液阀 {cylinderType} 缩回失败。";
+                Logs.LogError($"[SelfGrind] {msg}");
+                ReportWorkflowError(_workflowProgress, msg);
+                return false;
+            }
+
+            return true;
+        }
+
+        private bool IsDebugMode()
+        {
+            return _checkpoint?.Request?.RunMode == TableRepairRunMode.Debug;
+        }
+
+        private bool ShouldEnforceRuntimeInterlocks()
+        {
+            return SelfGrindRuntimeInterlocksEnabled && !IsDebugMode();
+        }
+
+        private static bool IsDebugRequest(TableRepairRequest request)
+        {
+            return request?.RunMode == TableRepairRunMode.Debug;
+        }
+
+        private void ReportWorkflowError(ITableRepairWorkflowProgress progress, string message)
+        {
+            if (string.IsNullOrWhiteSpace(message))
+            {
+                return;
+            }
+
+            Logs.LogError($"[SelfGrind] {message}");
+            progress?.ReportWorkflowError(message);
+        }
+
+        private void LogDebugInfo(string message)
+        {
+            if (IsDebugMode())
+            {
+                Logs.LogInfo($"[SelfGrind-Debug] {message}");
+            }
+        }
+
+        private void TryApplyDebugMoveOverride(ref double targetUm, ref double speedUmS)
+        {
+            if (!IsDebugMode() || !_debugOverrideActive || _debugTargetUm <= 0 || _debugSpeedUmS <= 0)
+            {
+                return;
+            }
+
+            targetUm = _debugTargetUm;
+            speedUmS = _debugSpeedUmS;
+            ClearDebugOverrides();
+        }
+
+        private void ClearDebugOverrides()
+        {
+            _debugOverrideActive = false;
+            _debugTargetUm = 0;
+            _debugSpeedUmS = 0;
+            _debugSparkOutSecondsOverride = 0;
+        }
+
+        private void ReportPhaseProgressForDebug(
+            ITableRepairWorkflowProgress progress,
+            SelfGrindPhaseWeights weights,
+            TableRepairWorkflowStep step,
+            double phaseProgress01,
+            double processProgress,
+            double targetUm,
+            double segmentStartUm)
+        {
+            if (IsDebugMode() && _debugProgress != null)
+            {
+                _debugProgress.ReportDebugPhaseProgress(
+                    step,
+                    Math.Min(100, Math.Max(0, phaseProgress01 * 100)),
+                    targetUm,
+                    segmentStartUm);
+                return;
+            }
+
+            ReportWeightedProgress(progress, weights, step, phaseProgress01, processProgress);
+        }
+
+        private async Task RunTelemetryLoopAsync(ITableRepairWorkflowProgress progress, CancellationToken cancellationToken)
+        {
+            while (!cancellationToken.IsCancellationRequested)
+            {
+                try
+                {
+                    progress?.ReportTelemetry(
+                        GetWheelPosition(),
+                        GetWheelRpm(),
+                        GetTableRpm(),
+                        GetWheelOverloadPercent(),
+                        GetTableOverloadPercent());
+
+                    await Task.Delay(200, cancellationToken).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                    break;
+                }
+            }
+        }
+
+        private async Task<bool> WaitForConditionAsync(
+            Func<bool> condition,
+            int timeoutMs,
+            string timeoutErrorMsg,
+            CancellationToken cancellationToken)
+        {
+            var elapsed = 0;
+            const int checkInterval = 200;
+
+            while (elapsed < timeoutMs && !condition())
+            {
+                await Task.Delay(checkInterval, cancellationToken).ConfigureAwait(false);
+                elapsed += checkInterval;
+            }
+
+            if (!condition())
+            {
+                Logs.LogError(timeoutErrorMsg);
+                return false;
+            }
+
+            return true;
+        }
+
+        private void OnTorqueAccidentExceeded(double torque)
+        {
+            lock (_torqueLock)
+            {
+                _torqueAccidentTriggered = true;
+            }
+
+            Logs.LogWarning($"Self-Grind torque accident exceeded ({torque}%).");
+        }
+
+        private void ThrowIfTorqueAccident()
+        {
+            if (!ShouldEnforceRuntimeInterlocks())
+            {
+                return;
+            }
+
+            lock (_torqueLock)
+            {
+                if (_torqueAccidentTriggered)
+                {
+                    throw new InvalidOperationException("Torque accident threshold exceeded.");
+                }
+            }
+        }
+
+        private double GetWheelPosition()
+        {
+            return _controlCard.GetActualPosition((ushort)AxisType.Wheel);
+        }
+
+        private double GetWheelRpm()
+        {
+            return _inventerService.CurrentFrequency / 0.04;
+        }
+
+        private double GetTableRpm()
+        {
+            if (_controlCard.ServoDatas.Count <= (int)AxisType.Table)
+            {
+                return 0;
+            }
+
+            return _controlCard.ServoDatas[(int)AxisType.Table].ActualVelocity;
+        }
+
+        private double GetWheelOverloadPercent()
+        {
+            return _inventerService.OutputTorque;
+        }
+
+        private double GetTableOverloadPercent()
+        {
+            if (_controlCard.ServoDatas.Count <= (int)AxisType.Table)
+            {
+                return 0;
+            }
+
+            return _controlCard.ServoDatas[(int)AxisType.Table].ActualTorque;
+        }
+
+        private bool IsWheelOverloadExceeded(double limit)
+        {
+            if (limit <= 0)
+            {
+                return false;
+            }
+
+            return GetWheelOverloadPercent() > limit;
+        }
+
+        private bool IsTableOverloadExceeded(double limit)
+        {
+            if (limit <= 0)
+            {
+                return false;
+            }
+
+            return GetTableOverloadPercent() > limit;
+        }
+
+        private static double ResolveRapidMoveSpeed(SelfGrindConfig config)
+        {
+            return config.RapidMoveSpeed > 0 ? config.RapidMoveSpeed : DefaultRapidMoveSpeed;
+        }
+
+        private static double ResolveSafetyGapSpeed(SelfGrindConfig config)
+        {
+            return config.SafetyGapSpeed > 0 ? config.SafetyGapSpeed : DefaultSafetyGapSpeed;
+        }
+
+        private static double ResolveRapidApproachOffset(SelfGrindConfig config)
+        {
+            return config.RapidApproachOffset > 0 ? config.RapidApproachOffset : DefaultRapidApproachOffset;
+        }
+
+        private static double ResolveSafetyEndBuffer(SelfGrindConfig config)
+        {
+            return config.SafetyEndBuffer > 0 ? config.SafetyEndBuffer : DefaultSafetyEndBuffer;
+        }
+
+        private static double ResolveGrindSpeed(SelfGrindConfig config)
+        {
+            return config.GrindSpeed > 0 ? config.GrindSpeed : DefaultGrindSpeed;
+        }
+
+        private static double ResolveWheelRpm(SelfGrindConfig config)
+        {
+            return config.WheelRpm > 0 ? config.WheelRpm : 1000;
+        }
+
+        private static double ResolveTableRpm(SelfGrindConfig config)
+        {
+            return config.TableRpm > 0 ? config.TableRpm : 200;
+        }
+
+        private static double ResolveSparkOutSeconds(SelfGrindConfig config)
+        {
+            return config.SparkOutSeconds > 0 ? config.SparkOutSeconds : 20;
+        }
+    }
+}
